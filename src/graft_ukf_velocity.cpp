@@ -42,6 +42,8 @@
 #include <graft/GraftState.h>
 #include <tf/transform_broadcaster.h>
 
+#include <boost/thread.hpp>
+
 GraftUKFVelocity ukfv;
 
 ros::Publisher state_pub;
@@ -55,6 +57,9 @@ boost::shared_ptr<tf::TransformBroadcaster> broadcaster_;
 
 std::string parent_frame_id_;
 std::string child_frame_id_;
+
+boost::mutex odom_mutex_;
+boost::thread save_odom_thread_;
 
 void publishTF(const nav_msgs::Odometry& msg){
   geometry_msgs::TransformStamped tf;
@@ -70,7 +75,35 @@ void publishTF(const nav_msgs::Odometry& msg){
   broadcaster_->sendTransform(tf);
 }
 
+
+void save_odom()
+{
+  ros::NodeHandle pnh("~");
+  std::map<std::string, double> odom_map;
+  while (ros::ok())
+  {
+    // Get odom frame parameters
+    double x, y, theta;
+    {
+      boost::mutex::scoped_lock lock(odom_mutex_);
+      x = odom_.pose.pose.position.x;
+      y = odom_.pose.pose.position.y;
+      theta = 2.0 * std::atan2(odom_.pose.pose.orientation.z,
+			       odom_.pose.pose.orientation.w);
+    }
+
+    // Update odom in rosparam
+    odom_map["x"] = x;
+    odom_map["y"] = y;
+    odom_map["theta"] = theta;
+    pnh.setParam("last_odom", odom_map);
+    ros::Duration(1.0).sleep();
+  }
+}
+
 void timer_callback(const ros::TimerEvent& event){
+        boost::mutex::scoped_lock lock(odom_mutex_);
+
 	double dt = ukfv.predictAndUpdate();
 
 	graft::GraftState state = *ukfv.getMessageFromState();
@@ -139,14 +172,36 @@ int main(int argc, char **argv)
 	ukfv.setProcessNoise(Q);
 	ukfv.setTopics(topics);
 
-	odom_.pose.pose.position.x = 0.0;
-	odom_.pose.pose.position.y = 0.0;
-	odom_.pose.pose.position.z = 0.0;
-
-	odom_.pose.pose.orientation.w = 1.0;
-	odom_.pose.pose.orientation.x = 0.0;
-	odom_.pose.pose.orientation.y = 0.0;
-	odom_.pose.pose.orientation.z = 0.0;
+        // Try loading previous saved odom pose from rosparam service
+        {
+          double x, y, theta;
+          pnh.param<double>("last_odom/x", x, NAN);
+          pnh.param<double>("last_odom/y", y, NAN);
+          pnh.param<double>("last_odom/theta", theta, NAN);
+          if (std::isfinite(x) && std::isfinite(y) && std::isfinite(theta))
+          {
+            ROS_INFO_NAMED("graft_ukf_velocity",
+                           "Using saved odom pose : x,y,theta = %f, %f, %f", x, y, theta);
+            odom_.pose.pose.position.x = x;
+            odom_.pose.pose.position.y = y;
+            odom_.pose.pose.position.z = 0.0;
+            odom_.pose.pose.orientation.x = 0.0;
+            odom_.pose.pose.orientation.y = 0.0;
+            odom_.pose.pose.orientation.z = sin(theta/2.0);
+            odom_.pose.pose.orientation.w = cos(theta/2.0);
+          }
+          else
+          {
+            ROS_INFO_NAMED("graft_ukf_velocity", "Invalid or no saved odom pose");
+            odom_.pose.pose.position.x = 0.0;
+            odom_.pose.pose.position.y = 0.0;
+            odom_.pose.pose.position.z = 0.0;
+            odom_.pose.pose.orientation.w = 1.0;
+            odom_.pose.pose.orientation.x = 0.0;
+            odom_.pose.pose.orientation.y = 0.0;
+            odom_.pose.pose.orientation.z = 0.0;
+          }
+        }
 
 	odom_.twist.twist.linear.x = 0.0;
 	odom_.twist.twist.linear.y = 0.0;
@@ -161,6 +216,13 @@ int main(int argc, char **argv)
 	// Start loop
 	ros::Timer timer = n.createTimer(ros::Duration(1.0/manager.getUpdateRate()), timer_callback);
 
+        // Start thread to save odom frame to rosparam
+        // Use thread instead of timer because parameter server may be slow
+        // to respond to requests
+        boost::thread save_odom_thread = boost::thread(save_odom);
+
 	// Spin
 	ros::spin();
+
+        save_odom_thread.join();
 }
